@@ -1,0 +1,1403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sultan Mohammed</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    background: #101018;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    overflow: hidden;
+  }
+  #wrap { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #5c94fc;
+    border: 4px solid #222;
+    box-shadow: 0 0 0 4px #444, 0 12px 40px rgba(0,0,0,0.7);
+    max-height: 98vh;
+    width: auto;
+  }
+  #hint { color: #888; font-size: 12px; letter-spacing: 1px; }
+  #fsBtn {
+    position: fixed; top: 10px; right: 10px; z-index: 20;
+    background: #222; color: #ffcc00; border: 2px solid #444;
+    font-family: monospace; font-size: 12px; letter-spacing: 1px;
+    padding: 6px 10px; cursor: pointer; image-rendering: pixelated;
+  }
+  #fsBtn:hover { background: #333; border-color: #ffcc00; }
+  body.fs #wrap { gap: 0; }
+  body.fs canvas {
+    max-height: none; width: auto; height: 100vh;
+    border: 0; box-shadow: none;
+  }
+  body.fs #hint { display: none; }
+</style>
+</head>
+<body>
+<button id="fsBtn" title="Toggle full screen (F)">⛶ FULL SCREEN</button>
+<div id="wrap">
+  <canvas id="game" width="256" height="240"></canvas>
+  <div id="hint">← → MOVE &nbsp;·&nbsp; Z / SPACE JUMP &nbsp;·&nbsp; SHIFT RUN &nbsp;·&nbsp; X FIRE (SPLITS) &nbsp;·&nbsp; H FLY &nbsp;·&nbsp; P PAUSE &nbsp;·&nbsp; F FULL SCREEN</div>
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================
+   SULTAN MOHAMMED — V7
+   Systems: constants -> audio -> input -> tiles -> entities
+            -> missions -> physics -> rendering -> game loop
+   ============================================================ */
+
+/* ---------- CONSTANTS (tune difficulty here) ---------- */
+const VIEW_W = 256, VIEW_H = 240;
+const TILE = 16;
+// Laptop-friendly: 2x base means 512x480 on a 1366x768 or 1920x1080 screen
+// V10: +30% over the V9 laptop fit (4 -> 5, 2 -> 3 at the low end)
+const SCALE = Math.max(3, Math.min(5, Math.floor((window.innerHeight * 1.1) / VIEW_H)));
+
+// Physics
+const GRAVITY          = 0.55;
+const MAX_FALL         = 9;
+const WALK_ACCEL       = 0.35;
+const RUN_ACCEL        = 0.55;
+const FRICTION         = 0.22;
+const WALK_MAX         = 1.8;
+const RUN_MAX          = 3.1;
+const JUMP_VEL         = -8.6;
+const JUMP_HOLD_FRAMES = 12;
+const COYOTE_FRAMES    = 6;
+const JUMP_BUFFER      = 6;
+const STOMP_BOUNCE     = -5.2;
+
+// Flight
+const FLY_SPEED        = 2.6;
+const FLY_LIFT         = -2.2;
+const FLY_SINK         = 2.2;
+const FLY_FUEL         = 240;   // frames of flight per pickup
+const FLY_FUEL_WARN    = 60;
+
+// Player
+const PLAYER_W = 12, PLAYER_H = 14;
+const BIG_H    = 22;
+const START_LIVES = 3;
+const INVULN_FRAMES = 90;
+
+// Enemies
+const GOOMBA_SPEED = 0.6;
+const FIREBALL_SPEED = 3.4;
+
+/* ---------- AUDIO ---------- */
+const Audio8 = (() => {
+  let ctx = null, muted = false, musicTimer = null;
+  function ensure() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === "suspended") ctx.resume();
+    return ctx;
+  }
+  function tone(freq, dur, type = "square", vol = 0.08, slideTo = null) {
+    if (muted) return;
+    const c = ensure();
+    const o = c.createOscillator(), g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, c.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, c.currentTime + dur);
+    g.gain.setValueAtTime(vol, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+    o.connect(g); g.connect(c.destination);
+    o.start(); o.stop(c.currentTime + dur + 0.02);
+  }
+  const sfx = {
+    jump:   () => tone(520, 0.12, "square", 0.07, 900),
+    coin:   () => { tone(988, 0.07, "square", 0.08); setTimeout(() => tone(1319, 0.12, "square", 0.08), 70); },
+    stomp:  () => tone(220, 0.10, "square", 0.09, 90),
+    brick:  () => tone(140, 0.12, "sawtooth", 0.08, 60),
+    power:  () => [523,659,784,1047].forEach((f,i)=>setTimeout(()=>tone(f,0.10,"square",0.08),i*70)),
+    fire:   () => tone(700, 0.08, "sawtooth", 0.06, 300),
+    hurt:   () => tone(400, 0.25, "square", 0.09, 120),
+    die:    () => [392,330,262,196].forEach((f,i)=>setTimeout(()=>tone(f,0.22,"square",0.09),i*140)),
+    win:    () => [523,659,784,1047,1319].forEach((f,i)=>setTimeout(()=>tone(f,0.16,"square",0.09),i*110)),
+    select: () => tone(660, 0.08, "square", 0.07),
+    fly:    () => { tone(392, 0.10, "triangle", 0.08, 784); setTimeout(()=>tone(784,0.16,"triangle",0.07,1175),90); },
+    flyEnd: () => tone(660, 0.16, "triangle", 0.06, 220)
+  };
+  const MELODY = [
+    659,659,0,659,0,523,659,0, 784,0,0,0,392,0,0,0,
+    523,0,0,392,0,0,330,0, 440,0,494,0,466,440,392,0,
+    659,659,0,659,0,523,659,0, 784,0,0,0,392,0,0,0
+  ];
+  function startMusic() {
+    if (muted || musicTimer) return;
+    let i = 0;
+    musicTimer = setInterval(() => {
+      const n = MELODY[i % MELODY.length];
+      if (n) tone(n, 0.14, "triangle", 0.04);
+      if (i % 4 === 0) tone(n ? n/2 : 130, 0.12, "square", 0.03);
+      i++;
+    }, 150);
+  }
+  function stopMusic() { if (musicTimer) { clearInterval(musicTimer); musicTimer = null; } }
+  function toggle() {
+    muted = !muted;
+    if (muted) stopMusic(); else startMusic();
+    return muted;
+  }
+  return { sfx, startMusic, stopMusic, toggle, get muted(){ return muted; } };
+})();
+
+/* ---------- INPUT ---------- */
+const Input = (() => {
+  const down = {}, pressed = {};
+  const MAP = {
+    ArrowLeft:"left", ArrowRight:"right", ArrowUp:"up", ArrowDown:"down",
+    KeyA:"left", KeyD:"right", KeyW:"up", KeyS:"down",
+    KeyZ:"jump", Space:"jump", KeyX:"fire", ShiftLeft:"run", ShiftRight:"run",
+    KeyP:"pause", Enter:"enter", KeyM:"mute", KeyF:"fullscreen", KeyH:"fly"
+  };
+  window.addEventListener("keydown", e => {
+    const a = MAP[e.code];
+    if (!a) return;
+    e.preventDefault();
+    if (!down[a]) pressed[a] = true;
+    down[a] = true;
+  });
+  window.addEventListener("keyup", e => {
+    const a = MAP[e.code];
+    if (!a) return;
+    e.preventDefault();
+    down[a] = false;
+  });
+  return {
+    held: a => !!down[a],
+    hit:  a => !!pressed[a],
+    clear: () => { for (const k in pressed) pressed[k] = false; }
+  };
+})();
+
+/* ---------- TILE MAP ---------- */
+// Symbols: . empty, X ground, B brick, ? question, C coin, P pipe, F flag,
+//          G goomba, ^ spike, = moving platform anchor, D door/pipe exit, S spawn,
+//          W wing pickup (grants flight fuel)
+const T = { EMPTY:0, GROUND:1, BRICK:2, QUESTION:3, PIPE:4, SPIKE:5, FLAG:6 };
+const SOLID = new Set([T.GROUND, T.BRICK, T.QUESTION, T.PIPE]);
+
+/* ---------- MISSIONS ---------- */
+// Each map is an array of strings, TILE pixels per char.
+const MISSIONS = [
+  {
+    name: "COIN SPRINT",
+    goal: "Collect 10 coins in 30 seconds",
+    time: 30 * 60,
+    goalType: "coins", goalCount: 10,
+    map: [
+      "..............................",
+      "..............................",
+      "....C.C.C......C.C.C..........",
+      "..............................",
+      "..........?...................",
+      "..............................",
+      "..S...........C.C.C.C.........",
+      "XXXXXXXX....XXXXXXXX......XXXX",
+      "XXXXXXXX....XXXXXXXX......XXXX",
+      "XXXXXXXX....XXXXXXXX......XXXX"
+    ]
+  },
+  {
+    name: "STOMP SQUAD",
+    goal: "Defeat 5 goombas",
+    time: 60 * 60,
+    goalType: "stomps", goalCount: 5,
+    map: [
+      "..............................",
+      "..............................",
+      "..............................",
+      "..............................",
+      ".......?........?.............",
+      "..............................",
+      "..S..G....G....G....G....G....",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    ]
+  },
+  {
+    name: "BRICK BREAKER",
+    goal: "Smash 8 bricks",
+    time: 45 * 60,
+    goalType: "bricks", goalCount: 8,
+    map: [
+      "..............................",
+      "..............................",
+      "....BBB.BBB.BBB.BBB...........",
+      "..............................",
+      "....?..........?..............",
+      "..............................",
+      "..S...........................",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    ]
+  },
+  {
+    name: "RESCUE RUN",
+    goal: "Reach the flag",
+    time: 60 * 60,
+    goalType: "flag", goalCount: 1,
+    map: [
+      "..............................",
+      "..............................",
+      "..............................",
+      "..............................",
+      "..............................",
+      "..............................",
+      "..S..........=........=......F",
+      "XXXXXXXX.....XXXXXXXX....XXXXX",
+      "XXXXXXXX.....XXXXXXXX....XXXXX",
+      "XXXXXXXX.....XXXXXXXX....XXXXX"
+    ]
+  },
+  {
+    name: "PIPE PUZZLE",
+    goal: "Enter the correct pipe",
+    time: 40 * 60,
+    goalType: "pipe", goalCount: 1,
+    map: [
+      "..............................",
+      "..............................",
+      "..............................",
+      "..............................",
+      "..........?........?..........",
+      "..............................",
+      "..S..P......P......D..........",
+      "XXXXXXXXXX.XXXXXXXX.XXXXXXXXXX",
+      "XXXXXXXXXX.XXXXXXXX.XXXXXXXXXX",
+      "XXXXXXXXXX.XXXXXXXX.XXXXXXXXXX"
+    ]
+  },
+  {
+    name: "FIRE TRIAL",
+    goal: "Kill 4 enemies with fireballs (no stomping)",
+    time: 60 * 60,
+    goalType: "firekills", goalCount: 4, startFire: true,
+    map: [
+      "..............................",
+      "..............................",
+      "..............................",
+      "..............................",
+      ".......?......................",
+      "..............................",
+      "..S..G....G....G....G.........",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    ]
+  },
+  {
+    name: "GAUNTLET",
+    goal: "Survive to the end",
+    time: 75 * 60,
+    goalType: "flag", goalCount: 1, spawnBehind: true,
+    map: [
+      "..............................",
+      "..............................",
+      "..............................",
+      "..............................",
+      "........?........?............",
+      "..............................",
+      "....^.....^......^......^.....",
+      "..S..G....G....G....G....G...F",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    ]
+  }
+];
+
+/* ---------- ENTITIES ---------- */
+class Entity {
+  constructor(x, y, w, h) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.vx = 0; this.vy = 0;
+    this.dead = false;
+  }
+  get left()   { return this.x; }
+  get right()  { return this.x + this.w; }
+  get top()    { return this.y; }
+  get bottom() { return this.y + this.h; }
+  overlaps(o) {
+    return this.left < o.right && this.right > o.left &&
+           this.top < o.bottom && this.bottom > o.top;
+  }
+}
+
+class Coin extends Entity {
+  constructor(tx, ty) {
+    // Generous hitbox: slightly larger than the drawn coin so pickups feel fair
+    super(tx * TILE + 1, ty * TILE + 1, 14, 14);
+    this.taken = false;
+    this.phase = Math.random() * Math.PI * 2;
+  }
+}
+
+class Wing extends Entity {
+  constructor(tx, ty) {
+    super(tx * TILE + 1, ty * TILE + 1, 14, 14);
+    this.taken = false;
+    this.phase = Math.random() * Math.PI * 2;
+  }
+}
+
+class Goomba extends Entity {
+  constructor(x, y) {
+    super(x, y, 14, 14);
+    this.vx = -GOOMBA_SPEED;
+    this.squashTimer = 0;
+    this.stomped = false;
+  }
+  update(level) {
+    if (this.stomped) { this.squashTimer++; if (this.squashTimer > 24) this.dead = true; return; }
+    this.vy = Math.min(this.vy + GRAVITY, MAX_FALL);
+    level.moveEntity(this, true, true);
+    if (this.hitWall) { this.vx = -this.vx; this.hitWall = false; }
+    if (this.y > VIEW_H + 100) this.dead = true;
+  }
+  stomp() { this.stomped = true; this.vx = 0; }
+  draw(g) {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    if (this.stomped) {
+      g.fillStyle = "#8b4513";
+      g.fillRect(x, y + 8, 14, 6);
+      return;
+    }
+    g.fillStyle = "#8b4513";
+    g.fillRect(x + 1, y, 12, 10);
+    g.fillStyle = "#000";
+    g.fillRect(x + 3, y + 3, 2, 3);
+    g.fillRect(x + 9, y + 3, 2, 3);
+    g.fillStyle = "#f4d9b0";
+    g.fillRect(x, y + 10, 5, 4);
+    g.fillRect(x + 9, y + 10, 5, 4);
+  }
+}
+
+class Fireball extends Entity {
+  constructor(x, y, dir, vy = 2, spread = false) {
+    super(x, y, 6, 6);
+    this.vx = FIREBALL_SPEED * dir;
+    this.vy = vy;
+    this.life = 120;
+    this.spread = spread;         // split shots travel straighter and die sooner
+    if (spread) this.life = 70;
+  }
+  update(level) {
+    this.vy = Math.min(this.vy + GRAVITY * 0.8, 7);
+    level.moveEntity(this, false, true);
+    if (this.hitWall) this.dead = true;
+    if (this.life-- <= 0 || this.y > VIEW_H + 50) this.dead = true;
+  }
+  draw(g) {
+    const x = Math.round(this.x), y = Math.round(this.y);
+    g.fillStyle = "#ffcc00";
+    g.fillRect(x + 1, y + 1, 4, 4);
+    g.fillStyle = "#ff4400";
+    g.fillRect(x + 2, y + 2, 2, 2);
+  }
+}
+
+class Player extends Entity {
+  constructor(x, y) {
+    super(x, y, PLAYER_W, PLAYER_H);
+    this.facing = 1;
+    this.onGround = false;
+    this.big = false;
+    this.fire = false;
+    this.invuln = 0;
+    this.jumpHold = 0;
+    this.coyote = 0;
+    this.buffer = 0;
+    this.animFrame = 0;
+    this.dying = false;
+    this.deathTimer = 0;
+    this.coins = 0;
+    // Flight
+    this.flying = false;
+    this.fuel = 0;
+    this.maxFuel = FLY_FUEL;
+    this.wingTimer = 0;
+    this.flyToggleLock = 0;
+    // TEST MODE: always able to fire and fly
+    this.fire = true;
+    this.maxFuel = Infinity;
+    this.fuel = Infinity;
+    this.spreadTimer = 0;      // visual/throttle timer for split fireballs
+    this.wantFire = false;
+    this.wantFlightToggle = false;
+    if (arguments.length > 2 && arguments[2] && arguments[2].startWings) {
+      this.fuel = FLY_FUEL;
+    }
+  }
+  setBig(v) {
+    this.big = v;
+    const oldH = this.h;
+    this.h = v ? BIG_H : PLAYER_H;
+    this.y -= (this.h - oldH);
+  }
+  addFuel(n) {
+    // Test mode: fuel is infinite, so this only plays the pickup feedback
+    this.fuel = Math.min(this.maxFuel, this.fuel + n);
+    this.wingTimer = 40;
+  }
+  update(level) {
+    if (this.dying) { this.deathTimer++; this.vy = Math.min(this.vy + GRAVITY, MAX_FALL); this.y += this.vy; return; }
+
+    const run = Input.held("run");
+    const accel = run ? RUN_ACCEL : WALK_ACCEL;
+    const maxSpd = run ? RUN_MAX : WALK_MAX;
+
+    // --- Flight toggle (H) ---
+    if (this.flyToggleLock > 0) this.flyToggleLock--;
+    const flyPressed = this.wantFlightToggle !== undefined ? this.wantFlightToggle : Input.hit("fly");
+    this.wantFlightToggle = false;
+    if (flyPressed && this.flyToggleLock === 0) {
+      if (this.flying) {
+        this.flying = false;
+        Audio8.sfx.flyEnd();
+      } else {
+        // Test mode: no fuel requirement, always allowed
+        this.flying = true;
+        Audio8.sfx.fly();
+      }
+      this.flyToggleLock = 8;
+    }
+
+    // --- Horizontal movement ---
+    if (this.flying) {
+      // Airborne steering: snappy, no gravity drag
+      if (Input.held("left"))       { this.vx = -FLY_SPEED; this.facing = -1; }
+      else if (Input.held("right")) { this.vx =  FLY_SPEED; this.facing =  1; }
+      else this.vx *= 0.85;
+    } else {
+      if (Input.held("left"))  { this.vx -= accel; this.facing = -1; }
+      else if (Input.held("right")) { this.vx += accel; this.facing = 1; }
+      else {
+        if (this.vx > 0) this.vx = Math.max(0, this.vx - FRICTION);
+        else if (this.vx < 0) this.vx = Math.min(0, this.vx + FRICTION);
+      }
+      this.vx = Math.max(-maxSpd, Math.min(maxSpd, this.vx));
+    }
+
+    // --- Vertical movement ---
+    if (this.flying) {
+      // Test mode: no fuel drain
+      if (Input.held("up") || Input.held("jump"))      this.vy = FLY_LIFT;
+      else if (Input.held("down"))                     this.vy = FLY_SINK;
+      else                                             this.vy = Math.sin(Date.now() / 200) * 0.6;
+      // Flight ignores coyote/jump buffer
+      this.jumpHold = 0;
+      this.coyote = 0;
+      this.buffer = 0;
+    } else {
+      // Jump
+      if (this.onGround) this.coyote = COYOTE_FRAMES; else if (this.coyote > 0) this.coyote--;
+      if (Input.hit("jump")) this.buffer = JUMP_BUFFER; else if (this.buffer > 0) this.buffer--;
+      if (this.buffer > 0 && this.coyote > 0) {
+        this.vy = JUMP_VEL;
+        this.jumpHold = JUMP_HOLD_FRAMES;
+        this.buffer = 0; this.coyote = 0; this.onGround = false;
+        Audio8.sfx.jump();
+      }
+      if (this.jumpHold > 0) {
+        if (Input.held("jump") && this.vy < 0) { this.vy -= 0.45; this.jumpHold--; }
+        else this.jumpHold = 0;
+      }
+      this.vy = Math.min(this.vy + GRAVITY, MAX_FALL);
+    }
+
+    this.onGround = false;
+    level.moveEntity(this, true, true);
+
+    // Landing cancels flight
+    if (this.flying && this.onGround) {
+      this.flying = false;
+      Audio8.sfx.flyEnd();
+    }
+
+    if (this.hitWall) { this.vx = 0; this.hitWall = false; }
+    if (this.y > VIEW_H + 60) { this.kill(); }
+
+    // --- Fire (X) : launches a 3-way spread ---
+    if (this.spreadTimer > 0) this.spreadTimer--;
+    const firePressed = this.wantFire !== undefined ? this.wantFire : Input.hit("fire");
+    this.wantFire = false;
+    if (this.fire && firePressed && this.spreadTimer === 0) {
+      const muzzleX = this.facing > 0 ? this.x + this.w : this.x - 6;
+      const muzzleY = this.y + 4;
+      // Middle shot, dead ahead
+      level.fireballs.push(new Fireball(muzzleX, muzzleY, this.facing, 0, true));
+      // Upper shot angled up
+      level.fireballs.push(new Fireball(muzzleX, muzzleY - 3, this.facing, -2.2, true));
+      // Lower shot angled down
+      level.fireballs.push(new Fireball(muzzleX, muzzleY + 3, this.facing, 2.6, true));
+      this.spreadTimer = 10;   // small gap so rapid taps don't spam the screen
+      Audio8.sfx.fire();
+      level.burst(this.x + this.w / 2, muzzleY + 2, "#ff8800", 4);
+    }
+
+    if (this.invuln > 0) this.invuln--;
+    if (this.wingTimer > 0) this.wingTimer--;
+    if (Math.abs(this.vx) > 0.2 && this.onGround) this.animFrame++; else this.animFrame = 0;
+  }
+  hurt() {
+    if (this.invuln > 0 || this.dying) return;
+    if (this.flying) { this.flying = false; this.invuln = INVULN_FRAMES; Audio8.sfx.hurt(); }
+    else if (this.fire) { this.invuln = INVULN_FRAMES; Audio8.sfx.hurt(); }
+    else if (this.big) { this.setBig(false); this.invuln = INVULN_FRAMES; Audio8.sfx.hurt(); }
+    else this.kill();
+  }
+  kill() {
+    if (this.dying) return;
+    this.dying = true;
+    this.deathTimer = 0;
+    this.flying = false;
+    this.vy = -7;
+    Audio8.sfx.die();
+  }
+  draw(g) {
+    if (this.invuln > 0 && Math.floor(this.invuln / 4) % 2 === 0) return;
+    const x = Math.round(this.x), y = Math.round(this.y);
+    const body = this.fire ? "#ffffff" : "#e52521";
+    const overall = this.fire ? "#e52521" : "#1a1aff";
+    // Cap
+    g.fillStyle = body;
+    g.fillRect(x, y, this.w, this.big ? 8 : 6);
+    // Face
+    g.fillStyle = "#f4d9b0";
+    g.fillRect(x + 1, y + (this.big ? 8 : 6), this.w - 2, 5);
+    g.fillStyle = "#000";
+    g.fillRect(x + (this.facing > 0 ? this.w - 4 : 2), y + (this.big ? 9 : 7), 2, 2);
+    // Overalls
+    g.fillStyle = overall;
+    g.fillRect(x + 1, y + (this.big ? 13 : 11), this.w - 2, this.h - (this.big ? 13 : 11));
+    // Legs
+    g.fillStyle = "#8b4513";
+    const legOffset = (this.onGround && Math.abs(this.vx) > 0.2) ? (Math.floor(this.animFrame / 6) % 2 ? 1 : -1) : 0;
+    g.fillRect(x + 1 + legOffset, y + this.h - 3, 4, 3);
+    g.fillRect(x + this.w - 5 - legOffset, y + this.h - 3, 4, 3);
+
+    // Wings while flying or just after a pickup
+    if (this.flying || this.wingTimer > 0) {
+      const flap = Math.floor(Date.now() / 70) % 2 === 0;
+      g.fillStyle = "#ffffff";
+      // Left wing
+      g.fillRect(x - 5, y + (flap ? 2 : 4), 5, 3);
+      g.fillRect(x - 7, y + (flap ? 4 : 6), 3, 3);
+      // Right wing
+      g.fillRect(x + this.w, y + (flap ? 2 : 4), 5, 3);
+      g.fillRect(x + this.w + 4, y + (flap ? 4 : 6), 3, 3);
+    }
+  }
+}
+
+/* ---------- LEVEL ---------- */
+class Level {
+  constructor(def) {
+    this.def = def;
+    this.parse(def.map);
+    this.reset();
+  }
+  parse(rows) {
+    this.h = rows.length;
+    this.w = rows[0].length;
+    this.grid = [];
+    this.spawn = { x: 32, y: 32 };
+    this.enemySpawns = [];
+    this.platformAnchors = [];
+    this.exitTile = null;
+    this.coinTiles = [];
+    this.wingTiles = [];
+    for (let r = 0; r < this.h; r++) {
+      const row = [];
+      for (let c = 0; c < this.w; c++) {
+        const ch = rows[r][c];
+        let t = T.EMPTY;
+        switch (ch) {
+          case "X": t = T.GROUND; break;
+          case "B": t = T.BRICK; break;
+          case "?": t = T.QUESTION; break;
+          case "P": t = T.PIPE; break;
+          case "^": t = T.SPIKE; break;
+          case "F": t = T.FLAG; break;
+          case "S": this.spawn = { x: c * TILE, y: r * TILE }; break;
+          case "G": this.enemySpawns.push({ x: c * TILE, y: r * TILE }); break;
+          case "=": this.platformAnchors.push({ x: c * TILE, y: r * TILE, tx: c, ty: r }); break;
+          case "D": this.exitTile = { x: c * TILE, y: r * TILE, tx: c, ty: r }; break;
+          case "C": this.coinTiles.push({ tx: c, ty: r }); break;
+          case "W": this.wingTiles.push({ tx: c, ty: r }); break;
+        }
+        row.push(t);
+      }
+      this.grid.push(row);
+    }
+  }
+  reset() {
+    this.player = new Player(this.spawn.x, this.spawn.y);
+    if (this.def.startFire) { this.player.setBig(true); this.player.fire = true; }
+    if (this.def.startWings) { this.player.fuel = FLY_FUEL; }
+    this.goombas = this.enemySpawns.map(s => new Goomba(s.x + 1, s.y + 2));
+    this.fireballs = [];
+    this.particles = [];
+    this.movingPlatforms = this.platformAnchors.map(a => ({
+      x: a.x, y: a.y, w: TILE * 2, h: 6,
+      ox: a.x, oy: a.y, phase: Math.random() * Math.PI * 2, range: 24
+    }));
+    // Real, collectable coins built from the map's C tiles
+    this.coins = this.coinTiles.map(t => new Coin(t.tx, t.ty));
+    this.wings = this.wingTiles.map(t => new Wing(t.tx, t.ty));
+    this.coinsCollected = 0;
+    this.stomps = 0;
+    this.bricksBroken = 0;
+    this.fireKills = 0;
+    this.reachedFlag = false;
+    this.enteredPipe = false;
+    this.spawnTimer = 0;
+  }
+  tileAt(tx, ty) {
+    if (tx < 0 || tx >= this.w || ty < 0 || ty >= this.h) return T.EMPTY;
+    return this.grid[ty][tx];
+  }
+  solidAt(tx, ty) { return SOLID.has(this.tileAt(tx, ty)); }
+
+  // Axis-separated AABB collision. useX/useY toggle which axes to test.
+  moveEntity(e, useX, useY) {
+    e.hitWall = false;
+    if (useX) {
+      e.x += e.vx;
+      const dir = e.vx > 0 ? 1 : -1;
+      if (e.vx !== 0) {
+        const edge = dir > 0 ? e.right : e.left;
+        const tx = Math.floor((edge + dir * 0.01) / TILE);
+        const ty0 = Math.floor(e.top / TILE);
+        const ty1 = Math.floor((e.bottom - 0.01) / TILE);
+        for (let ty = ty0; ty <= ty1; ty++) {
+          if (this.solidAt(tx, ty)) {
+            e.x = dir > 0 ? tx * TILE - e.w : (tx + 1) * TILE;
+            e.hitWall = true;
+            break;
+          }
+        }
+      }
+    }
+    if (useY) {
+      e.y += e.vy;
+      const dir = e.vy > 0 ? 1 : -1;
+      if (e.vy !== 0) {
+        const edge = dir > 0 ? e.bottom : e.top;
+        const ty = Math.floor((edge + dir * 0.01) / TILE);
+        const tx0 = Math.floor(e.left / TILE);
+        const tx1 = Math.floor((e.right - 0.01) / TILE);
+        for (let tx = tx0; tx <= tx1; tx++) {
+          if (this.solidAt(tx, ty)) {
+            e.y = dir > 0 ? ty * TILE - e.h : (ty + 1) * TILE;
+            e.vy = 0;
+            if (dir > 0) e.onGround = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  hitBlockAt(tx, ty) {
+    const t = this.tileAt(tx, ty);
+    if (t === T.BRICK) {
+      this.grid[ty][tx] = T.EMPTY;
+      this.bricksBroken++;
+      Audio8.sfx.brick();
+      this.burst(tx * TILE + 8, ty * TILE + 8, "#c84c0c", 6);
+      return true;
+    }
+    if (t === T.QUESTION) {
+      this.grid[ty][tx] = T.EMPTY;
+      Audio8.sfx.coin();
+      this.coinsCollected++;
+      this.player.coins++;
+      this.burst(tx * TILE + 8, ty * TILE + 4, "#ffcc00", 5);
+      // Test mode: player already has fire + wings, so just refill the gauge
+      if (!this.player.big) { this.player.setBig(true); }
+      this.player.fire = true;
+      this.player.addFuel(FLY_FUEL);
+      Audio8.sfx.power();
+      return true;
+    }
+    return false;
+  }
+
+  burst(x, y, color, n) {
+    for (let i = 0; i < n; i++) {
+      this.particles.push({
+        x, y, vx: (Math.random()-0.5)*3, vy: -Math.random()*3-1,
+        life: 30, color
+      });
+    }
+  }
+
+  update() {
+    const p = this.player;
+    p.update(this);
+
+    // Block bumping: if player's head hits a block while moving up
+    if (p.vy < 0) {
+      const headY = Math.floor((p.top - 1) / TILE);
+      const x0 = Math.floor(p.left / TILE);
+      const x1 = Math.floor((p.right - 0.01) / TILE);
+      for (let tx = x0; tx <= x1; tx++) {
+        if (this.hitBlockAt(tx, headY)) break;
+      }
+    }
+
+    // Moving platforms (simple vertical bob)
+    for (const mp of this.movingPlatforms) {
+      mp.phase += 0.02;
+      mp.y = mp.oy + Math.sin(mp.phase) * mp.range;
+    }
+
+    // Goombas
+    for (const gb of this.goombas) {
+      if (gb.dead) continue;
+      gb.update(this);
+      if (gb.stomped) continue;
+      if (gb.overlaps(p) && !p.dying) {
+        if (p.vy > 0 && p.bottom - p.vy <= gb.top + 4) {
+          gb.stomp();
+          p.vy = STOMP_BOUNCE;
+          this.stomps++;
+          Audio8.sfx.stomp();
+          this.burst(gb.x + 7, gb.y + 7, "#8b4513", 4);
+        } else {
+          p.hurt();
+        }
+      }
+    }
+
+    // Fireballs
+    for (const fb of this.fireballs) {
+      fb.update(this);
+      for (const gb of this.goombas) {
+        if (gb.dead || gb.stomped) continue;
+        if (fb.overlaps(gb)) {
+          gb.dead = true;
+          fb.dead = true;
+          this.fireKills++;
+          Audio8.sfx.stomp();
+          this.burst(gb.x + 7, gb.y + 7, "#ff4400", 6);
+        }
+      }
+    }
+    this.fireballs = this.fireballs.filter(f => !f.dead);
+    this.goombas = this.goombas.filter(g => !g.dead);
+
+    // Coins — collectable on touch
+    for (const c of this.coins) {
+      if (c.taken) continue;
+      if (p.overlaps(c)) {
+        c.taken = true;
+        this.coinsCollected++;
+        p.coins++;
+        Audio8.sfx.coin();
+        this.burst(c.x + 4, c.y + 4, "#ffcc00", 4);
+      }
+    }
+
+    // Wing pickups — grant flight fuel
+    for (const w of this.wings) {
+      if (w.taken) continue;
+      if (p.overlaps(w)) {
+        w.taken = true;
+        p.addFuel(FLY_FUEL);
+        Audio8.sfx.fly();
+        this.burst(w.x + 4, w.y + 4, "#ffffff", 6);
+      }
+    }
+
+    // Flag
+    for (let r = 0; r < this.h; r++) {
+      for (let c = 0; c < this.w; c++) {
+        if (this.grid[r][c] === T.FLAG) {
+          const fx = c * TILE, fy = r * TILE;
+          if (p.right > fx && p.left < fx + TILE && p.bottom > fy && p.top < fy + TILE) {
+            this.reachedFlag = true;
+          }
+        }
+      }
+    }
+
+    // Spike damage
+    for (let r = 0; r < this.h; r++) {
+      for (let c = 0; c < this.w; c++) {
+        if (this.grid[r][c] === T.SPIKE) {
+          const sx = c * TILE, sy = r * TILE;
+          if (p.right > sx && p.left < sx + TILE && p.bottom > sy + 6 && p.top < sy + TILE) {
+            p.hurt();
+          }
+        }
+      }
+    }
+
+    // Exit pipe
+    if (this.exitTile) {
+      const e = this.exitTile;
+      if (p.right > e.x && p.left < e.x + TILE && p.bottom > e.y && p.top < e.y + TILE) {
+        this.enteredPipe = true;
+      }
+    }
+
+    // Particles
+    for (const pt of this.particles) {
+      pt.x += pt.vx; pt.y += pt.vy; pt.vy += 0.2; pt.life--;
+    }
+    this.particles = this.particles.filter(pt => pt.life > 0);
+
+    // Gauntlet: spawn enemies behind the player
+    if (this.def.spawnBehind) {
+      this.spawnTimer++;
+      if (this.spawnTimer > 180) {
+        this.spawnTimer = 0;
+        const gb = new Goomba(p.x - 60, p.y - 10);
+        gb.vx = GOOMBA_SPEED;
+        this.goombas.push(gb);
+      }
+    }
+  }
+
+  goalMet() {
+    const d = this.def;
+    switch (d.goalType) {
+      case "coins":     return this.coinsCollected >= d.goalCount;
+      case "stomps":    return this.stomps >= d.goalCount;
+      case "bricks":    return this.bricksBroken >= d.goalCount;
+      case "flag":      return this.reachedFlag;
+      case "pipe":      return this.enteredPipe;
+      case "firekills": return this.fireKills >= d.goalCount;
+    }
+    return false;
+  }
+
+  progressText() {
+    const d = this.def;
+    switch (d.goalType) {
+      case "coins":     return this.coinsCollected + "/" + d.goalCount;
+      case "stomps":    return this.stomps + "/" + d.goalCount;
+      case "bricks":    return this.bricksBroken + "/" + d.goalCount;
+      case "firekills": return this.fireKills + "/" + d.goalCount;
+      case "flag":      return this.reachedFlag ? "DONE" : "GO";
+      case "pipe":      return this.enteredPipe ? "DONE" : "GO";
+    }
+    return "";
+  }
+
+  draw(g, camX) {
+    // Sky
+    g.fillStyle = "#5c94fc";
+    g.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    // Background hills (parallax)
+    g.fillStyle = "#3c8c3c";
+    for (let i = 0; i < 6; i++) {
+      const hx = (i * 140 - camX * 0.3) % (VIEW_W + 140) - 70;
+      g.beginPath();
+      g.arc(hx, 200, 50, Math.PI, 0);
+      g.fill();
+    }
+
+    g.save();
+    g.translate(-Math.round(camX), 0);
+
+    // Tiles
+    const startCol = Math.max(0, Math.floor(camX / TILE) - 1);
+    const endCol = Math.min(this.w, Math.floor((camX + VIEW_W) / TILE) + 2);
+    for (let r = 0; r < this.h; r++) {
+      for (let c = startCol; c < endCol; c++) {
+        const t = this.grid[r][c];
+        if (t === T.EMPTY) continue;
+        const x = c * TILE, y = r * TILE;
+        this.drawTile(g, t, x, y);
+      }
+    }
+
+    // Coins
+    const tNow = Date.now();
+    for (const c of this.coins) {
+      if (c.taken) continue;
+      const wobble = Math.round(Math.sin(tNow / 150 + c.phase) * 2);
+      g.fillStyle = "#ffcc00";
+      g.fillRect(c.x + 3 + wobble, c.y + 2, 8, 10);
+      g.fillStyle = "#fff9c0";
+      g.fillRect(c.x + 5 + wobble, c.y + 4, 2, 6);
+      g.fillStyle = "#c08000";
+      g.fillRect(c.x + 3 + wobble, c.y + 2, 8, 1);
+    }
+
+    // Wing pickups
+    for (const w of this.wings) {
+      if (w.taken) continue;
+      const bob = Math.round(Math.sin(tNow / 200 + w.phase) * 2);
+      g.fillStyle = "#ffffff";
+      g.fillRect(w.x + 2, w.y + 4 + bob, 10, 4);
+      g.fillRect(w.x, w.y + 6 + bob, 4, 4);
+      g.fillRect(w.x + 10, w.y + 6 + bob, 4, 4);
+      g.fillStyle = "#c0e0ff";
+      g.fillRect(w.x + 3, w.y + 5 + bob, 8, 2);
+    }
+
+    // Moving platforms
+    for (const mp of this.movingPlatforms) {
+      g.fillStyle = "#a0522d";
+      g.fillRect(mp.x, Math.round(mp.y), mp.w, mp.h);
+      g.fillStyle = "#d2691e";
+      g.fillRect(mp.x, Math.round(mp.y), mp.w, 2);
+    }
+
+    // Goombas
+    for (const gb of this.goombas) gb.draw(g);
+
+    // Fireballs
+    for (const fb of this.fireballs) fb.draw(g);
+
+    // Particles
+    for (const pt of this.particles) {
+      g.fillStyle = pt.color;
+      g.globalAlpha = Math.min(1, pt.life / 20);
+      g.fillRect(Math.round(pt.x), Math.round(pt.y), 3, 3);
+      g.globalAlpha = 1;
+    }
+
+    // Player
+    this.player.draw(g);
+
+    g.restore();
+  }
+
+  drawTile(g, t, x, y) {
+    switch (t) {
+      case T.GROUND:
+        g.fillStyle = "#c84c0c";
+        g.fillRect(x, y, TILE, TILE);
+        g.fillStyle = "#e07030";
+        g.fillRect(x, y, TILE, 3);
+        g.fillStyle = "#8b3000";
+        g.fillRect(x, y + TILE - 2, TILE, 2);
+        g.fillRect(x + 7, y + 3, 2, TILE - 5);
+        g.fillRect(x, y + 8, 7, 1);
+        g.fillRect(x + 9, y + 8, 7, 1);
+        break;
+      case T.BRICK:
+        g.fillStyle = "#c84c0c";
+        g.fillRect(x, y, TILE, TILE);
+        g.fillStyle = "#e07030";
+        g.fillRect(x + 1, y + 1, TILE - 2, 2);
+        g.fillStyle = "#8b3000";
+        g.fillRect(x, y + 7, TILE, 1);
+        g.fillRect(x + 7, y, 1, 7);
+        g.fillRect(x + 3, y + 8, 1, 8);
+        g.fillRect(x + 11, y + 8, 1, 8);
+        break;
+      case T.QUESTION:
+        g.fillStyle = "#e8a020";
+        g.fillRect(x, y, TILE, TILE);
+        g.fillStyle = "#ffd060";
+        g.fillRect(x + 1, y + 1, TILE - 2, 2);
+        g.fillStyle = "#a06000";
+        g.fillRect(x + 4, y + 4, 8, 2);
+        g.fillRect(x + 4, y + 6, 2, 3);
+        g.fillRect(x + 8, y + 6, 2, 3);
+        g.fillRect(x + 7, y + 9, 2, 2);
+        g.fillRect(x + 7, y + 12, 2, 2);
+        break;
+      case T.PIPE:
+        g.fillStyle = "#00a800";
+        g.fillRect(x, y, TILE, TILE);
+        g.fillStyle = "#40d040";
+        g.fillRect(x + 2, y, 3, TILE);
+        g.fillStyle = "#006000";
+        g.fillRect(x + TILE - 3, y, 3, TILE);
+        break;
+      case T.SPIKE:
+        g.fillStyle = "#c0c0c0";
+        for (let i = 0; i < 4; i++) {
+          g.beginPath();
+          g.moveTo(x + i * 4, y + TILE);
+          g.lineTo(x + i * 4 + 2, y + 4);
+          g.lineTo(x + i * 4 + 4, y + TILE);
+          g.fill();
+        }
+        break;
+      case T.FLAG:
+        g.fillStyle = "#c0c0c0";
+        g.fillRect(x + 7, y, 2, TILE);
+        g.fillStyle = "#00c000";
+        g.beginPath();
+        g.moveTo(x + 9, y + 2);
+        g.lineTo(x + 15, y + 6);
+        g.lineTo(x + 9, y + 10);
+        g.fill();
+        break;
+    }
+  }
+}
+
+/* ---------- HUD FONT ---------- */
+const FONT = {
+  "0":[0b111,0b101,0b101,0b101,0b111],"1":[0b010,0b110,0b010,0b010,0b111],
+  "2":[0b111,0b001,0b111,0b100,0b111],"3":[0b111,0b001,0b111,0b001,0b111],
+  "4":[0b101,0b101,0b111,0b001,0b001],"5":[0b111,0b100,0b111,0b001,0b111],
+  "6":[0b111,0b100,0b111,0b101,0b111],"7":[0b111,0b001,0b001,0b001,0b001],
+  "8":[0b111,0b101,0b111,0b101,0b111],"9":[0b111,0b101,0b111,0b001,0b111],
+  "A":[0b111,0b101,0b111,0b101,0b101],"B":[0b110,0b101,0b110,0b101,0b110],
+  "C":[0b111,0b100,0b100,0b100,0b111],"D":[0b110,0b101,0b101,0b101,0b110],
+  "E":[0b111,0b100,0b111,0b100,0b111],"F":[0b111,0b100,0b111,0b100,0b100],
+  "G":[0b111,0b100,0b101,0b101,0b111],"H":[0b101,0b101,0b111,0b101,0b101],
+  "I":[0b111,0b010,0b010,0b010,0b111],"J":[0b001,0b001,0b001,0b101,0b111],
+  "K":[0b101,0b101,0b110,0b101,0b101],"L":[0b100,0b100,0b100,0b100,0b111],
+  "M":[0b101,0b111,0b111,0b101,0b101],"N":[0b101,0b111,0b111,0b111,0b101],
+  "O":[0b111,0b101,0b101,0b101,0b111],"P":[0b111,0b101,0b111,0b100,0b100],
+  "Q":[0b111,0b101,0b101,0b111,0b011],"R":[0b111,0b101,0b111,0b110,0b101],
+  "S":[0b111,0b100,0b111,0b001,0b111],"T":[0b111,0b010,0b010,0b010,0b010],
+  "U":[0b101,0b101,0b101,0b101,0b111],"V":[0b101,0b101,0b101,0b101,0b010],
+  "W":[0b101,0b101,0b111,0b111,0b101],"X":[0b101,0b101,0b010,0b101,0b101],
+  "Y":[0b101,0b101,0b010,0b010,0b010],"Z":[0b111,0b001,0b010,0b100,0b111],
+  " ":[0,0,0,0,0],":":[0,0b010,0,0b010,0],"/":[0b001,0b001,0b010,0b100,0b100],
+  "-":[0,0,0b111,0,0],".":[0,0,0,0,0b010],"!":[0b010,0b010,0b010,0,0b010],
+  "*":[0b101,0b010,0b111,0b010,0b101]
+};
+function drawText(g, str, x, y, color = "#ffffff", px = 1) {
+  g.fillStyle = color;
+  let cx = x;
+  for (const ch of str.toUpperCase()) {
+    const glyph = FONT[ch];
+    if (glyph) {
+      for (let r = 0; r < 5; r++) {
+        for (let c = 0; c < 3; c++) {
+          if (glyph[r] & (1 << (2 - c))) {
+            g.fillRect(cx + c * px, y + r * px, px, px);
+          }
+        }
+      }
+    }
+    cx += 4 * px;
+  }
+}
+function textWidth(str, px = 1) { return str.length * 4 * px; }
+
+/* ---------- GAME ---------- */
+const canvas = document.getElementById("game");
+canvas.width = VIEW_W; canvas.height = VIEW_H;
+canvas.style.width = (VIEW_W * SCALE) + "px";
+canvas.style.height = (VIEW_H * SCALE) + "px";
+const g = canvas.getContext("2d");
+g.imageSmoothingEnabled = false;
+
+/* ---------- FULL SCREEN ---------- */
+const FullScreen = (() => {
+  let active = false;
+  function apply() {
+    document.body.classList.toggle("fs", active);
+    const btn = document.getElementById("fsBtn");
+    if (btn) btn.textContent = active ? "✕ EXIT FULL SCREEN" : "⛶ FULL SCREEN";
+  }
+  function enter() {
+    active = true; apply();
+    const el = document.documentElement;
+    if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+  }
+  function exit() {
+    active = false; apply();
+    if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  }
+  function toggle() { active ? exit() : enter(); }
+  window.addEventListener("load", () => {
+    const btn = document.getElementById("fsBtn");
+    if (btn) btn.addEventListener("click", toggle);
+  });
+  document.addEventListener("fullscreenchange", () => {
+    if (!document.fullscreenElement && active) { active = false; apply(); }
+  });
+  return { toggle, get active() { return active; } };
+})();
+
+const STATE = { TITLE: 0, SELECT: 1, PLAY: 2, PAUSE: 3, RESULT: 4, GAMEOVER: 5 };
+
+const Game = {
+  state: STATE.TITLE,
+  missionIndex: 0,
+  lives: START_LIVES,
+  level: null,
+  timer: 0,
+  timeLimit: 0,
+  frame: 0,
+  best: {},
+  selected: 0,
+  unlocked: 1,
+  resultWin: false,
+  shake: 0,
+
+  init() {
+    try { this.best = JSON.parse(localStorage.getItem("pakai_mario_best") || "{}"); } catch(e){ this.best = {}; }
+    this.selected = 0;
+  },
+  saveBest() {
+    try { localStorage.setItem("pakai_mario_best", JSON.stringify(this.best)); } catch(e){}
+  },
+  startMission(i) {
+    this.missionIndex = i;
+    this.lives = START_LIVES;
+    this.loadLevel();
+    this.state = STATE.PLAY;
+    Audio8.startMusic();
+  },
+  loadLevel() {
+    this.level = new Level(MISSIONS[this.missionIndex]);
+    this.timeLimit = MISSIONS[this.missionIndex].time;
+    this.timer = this.timeLimit;
+  },
+  update() {
+    this.frame++;
+    if (this.shake > 0) this.shake--;
+
+    switch (this.state) {
+      case STATE.TITLE:
+        if (Input.hit("jump") || Input.hit("enter")) { Audio8.sfx.select(); this.state = STATE.SELECT; }
+        break;
+      case STATE.SELECT: {
+        const total = MISSIONS.length;
+        if (Input.hit("left"))  { this.selected = (this.selected - 1 + total) % total; Audio8.sfx.select(); }
+        if (Input.hit("right")) { this.selected = (this.selected + 1) % total; Audio8.sfx.select(); }
+        if (Input.hit("up"))    { this.selected = Math.max(0, this.selected - 3); Audio8.sfx.select(); }
+        if (Input.hit("down"))  { this.selected = Math.min(total - 1, this.selected + 3); Audio8.sfx.select(); }
+        if (Input.hit("jump") || Input.hit("enter")) {
+          if (this.selected < this.unlocked) { Audio8.sfx.select(); this.startMission(this.selected); }
+        }
+        break;
+      }
+      case STATE.PLAY: {
+        const lv = this.level;
+        // --- Global keys first, so no early break can swallow them ---
+        if (Input.hit("pause")) { this.state = STATE.PAUSE; Audio8.stopMusic(); break; }
+        if (Input.hit("mute")) Audio8.toggle();
+        if (Input.hit("fullscreen")) FullScreen.toggle();
+        // Capture action taps immediately, before level.update() consumes the frame
+        const wantFire = Input.hit("fire");
+        const wantFly  = Input.hit("fly");
+        if (lv) {
+          lv.player.wantFire = wantFire;
+          lv.player.wantFlightToggle = wantFly;
+        }
+        lv.update();
+        this.timer--;
+        if (lv.player.dying) {
+          if (lv.player.deathTimer > 90) {
+            this.lives--;
+            if (this.lives <= 0) { this.state = STATE.GAMEOVER; Audio8.stopMusic(); }
+            else this.loadLevel();
+          }
+          break;
+        }
+        if (this.timer <= 0) { lv.player.kill(); break; }
+        if (lv.goalMet()) {
+          this.resultWin = true;
+          this.state = STATE.RESULT;
+          Audio8.stopMusic();
+          Audio8.sfx.win();
+          if (this.missionIndex + 1 < MISSIONS.length && this.unlocked < this.missionIndex + 2) {
+            this.unlocked = this.missionIndex + 2;
+          }
+          const key = "m" + this.missionIndex;
+          const score = this.timer;
+          if (!this.best[key] || score > this.best[key]) { this.best[key] = score; this.saveBest(); }
+        }
+        break;
+      }
+      case STATE.PAUSE:
+        if (Input.hit("pause") || Input.hit("enter")) { this.state = STATE.PLAY; Audio8.startMusic(); }
+        if (Input.hit("mute")) Audio8.toggle();
+        if (Input.hit("fullscreen")) FullScreen.toggle();
+        break;
+      case STATE.RESULT:
+        if (Input.hit("jump") || Input.hit("enter")) {
+          if (this.missionIndex + 1 < MISSIONS.length && this.missionIndex + 1 < this.unlocked) {
+            this.startMission(this.missionIndex + 1);
+          } else {
+            this.state = STATE.SELECT;
+          }
+        }
+        break;
+      case STATE.GAMEOVER:
+        if (Input.hit("jump") || Input.hit("enter")) this.state = STATE.SELECT;
+        break;
+    }
+  },
+
+  draw() {
+    g.save();
+    if (this.shake > 0) {
+      g.translate((Math.random()-0.5)*4, (Math.random()-0.5)*4);
+    }
+    switch (this.state) {
+      case STATE.TITLE:    this.drawTitle(); break;
+      case STATE.SELECT:   this.drawSelect(); break;
+      case STATE.PLAY:     this.drawPlay(); break;
+      case STATE.PAUSE:    this.drawPlay(); this.drawPause(); break;
+      case STATE.RESULT:   this.drawPlay(); this.drawResult(); break;
+      case STATE.GAMEOVER: this.drawGameOver(); break;
+    }
+    g.restore();
+  },
+
+  drawTitle() {
+    g.fillStyle = "#5c94fc";
+    g.fillRect(0, 0, VIEW_W, VIEW_H);
+    g.fillStyle = "#c84c0c";
+    g.fillRect(0, 200, VIEW_W, 40);
+    g.fillStyle = "#e07030";
+    g.fillRect(0, 200, VIEW_W, 4);
+    drawText(g, "SULTAN", VIEW_W/2 - textWidth("SULTAN", 4)/2, 40, "#ffffff", 4);
+    drawText(g, "MOHAMMED", VIEW_W/2 - textWidth("MOHAMMED", 3)/2, 80, "#ffcc00", 3);
+    drawText(g, "PAKAI.DEV", VIEW_W/2 - textWidth("PAKAI.DEV", 3)/2, 108, "#e52521", 3);
+    drawText(g, "V7 TEST BUILD", VIEW_W/2 - textWidth("V7 TEST BUILD", 1)/2, 138, "#4cff4c", 1);
+    if (Math.floor(this.frame / 30) % 2 === 0) {
+      drawText(g, "PRESS Z OR ENTER", VIEW_W/2 - textWidth("PRESS Z OR ENTER", 1)/2, 160, "#ffffff", 1);
+    }
+    drawText(g, "X = 3-WAY FIRE   H = FLY (ALWAYS ON)", 8, 224, "#222222", 1);
+  },
+
+  drawSelect() {
+    g.fillStyle = "#101018";
+    g.fillRect(0, 0, VIEW_W, VIEW_H);
+    drawText(g, "SELECT MISSION", 8, 10, "#ffcc00", 2);
+    for (let i = 0; i < MISSIONS.length; i++) {
+      const col = i % 3, row = Math.floor(i / 3);
+      const x = 10 + col * 80, y = 40 + row * 60;
+      const locked = i >= this.unlocked;
+      const isSel = i === this.selected;
+      g.fillStyle = isSel ? "#2a2a40" : "#181824";
+      g.fillRect(x, y, 74, 52);
+      g.strokeStyle = isSel ? "#ffcc00" : (locked ? "#444" : "#666");
+      g.lineWidth = 1;
+      g.strokeRect(x + 0.5, y + 0.5, 73, 51);
+      if (locked) {
+        drawText(g, "LOCKED", x + 6, y + 22, "#555", 1);
+        continue;
+      }
+      g.fillStyle = "#e52521";
+      g.fillRect(x + 4, y + 4, 14, 14);
+      drawText(g, String(i + 1), x + 8, y + 8, "#ffffff", 1);
+      const name = MISSIONS[i].name;
+      drawText(g, name.slice(0, 18), x + 4, y + 24, "#ffffff", 1);
+      drawText(g, name.slice(18, 36), x + 4, y + 32, "#ffffff", 1);
+      const b = this.best["m" + i];
+      if (b) {
+        const secs = Math.ceil(b / 60);
+        drawText(g, "BEST " + secs + "S", x + 4, y + 42, "#4cff4c", 1);
+      }
+    }
+    const m = MISSIONS[this.selected];
+    drawText(g, m.goal.toUpperCase().slice(0, 40), 8, 218, "#ffcc00", 1);
+    drawText(g, "Z START", 8, 228, "#888", 1);
+  },
+
+  drawPlay() {
+    const lv = this.level;
+    if (!lv) return;
+    const camX = Math.max(0, Math.min(lv.w * TILE - VIEW_W,
+      lv.player.x + lv.player.w / 2 - VIEW_W / 2));
+    lv.draw(g, camX);
+
+    // HUD
+    g.fillStyle = "rgba(0,0,0,0.45)";
+    g.fillRect(0, 0, VIEW_W, 20);
+    drawText(g, MISSIONS[this.missionIndex].name.slice(0, 16), 4, 3, "#ffcc00", 1);
+    drawText(g, "LIVES " + this.lives, 4, 12, "#ffffff", 1);
+    const secs = Math.max(0, Math.ceil(this.timer / 60));
+    const timeColor = secs <= 5 ? "#ff4040" : "#ffffff";
+    drawText(g, "TIME " + secs, 100, 3, timeColor, 1);
+    drawText(g, "GOAL " + lv.progressText(), 100, 12, "#4cff4c", 1);
+    drawText(g, "COIN " + lv.player.coins, 190, 3, "#ffcc00", 1);
+    drawText(g, "STOMP " + lv.stomps, 190, 12, "#ffffff", 1);
+
+    // Test-mode status strip: fire + flight are always available
+    const p = lv.player;
+    const strip = p.flying ? "FLYING - H TO LAND" : "X FIRE  H FLY";
+    drawText(g, strip, VIEW_W/2 - textWidth(strip, 1)/2, 24,
+             p.flying ? "#4cff4c" : "#c0e0ff", 1);
+    if (!p.flying && p.spreadTimer > 0) {
+      drawText(g, "SPREAD!", VIEW_W/2 - textWidth("SPREAD!", 1)/2, 32, "#ff8800", 1);
+    }
+  },
+
+  drawPause() {
+    g.fillStyle = "rgba(0,0,0,0.7)";
+    g.fillRect(0, 0, VIEW_W, VIEW_H);
+    drawText(g, "PAUSED", VIEW_W/2 - textWidth("PAUSED", 3)/2, 100, "#ffffff", 3);
+    drawText(g, "P TO RESUME", VIEW_W/2 - textWidth("P TO RESUME", 1)/2, 140, "#ffcc00", 1);
+    drawText(g, "M TO " + (Audio8.muted ? "UNMUTE" : "MUTE"), VIEW_W/2 - textWidth("M TO MUTE", 1)/2, 152, "#888", 1);
+    drawText(g, "F TO FULL SCREEN", VIEW_W/2 - textWidth("F TO FULL SCREEN", 1)/2, 164, "#888", 1);
+  },
+
+  drawResult() {
+    g.fillStyle = "rgba(0,0,0,0.75)";
+    g.fillRect(0, 0, VIEW_W, VIEW_H);
+    drawText(g, "MISSION CLEAR", VIEW_W/2 - textWidth("MISSION CLEAR", 2)/2, 50, "#4cff4c", 2);
+    const lv = this.level;
+    drawText(g, MISSIONS[this.missionIndex].name, VIEW_W/2 - textWidth(MISSIONS[this.missionIndex].name, 1)/2, 80, "#ffcc00", 1);
+    const secsLeft = Math.ceil(this.timer / 60);
+    drawText(g, "TIME LEFT " + secsLeft + "S", VIEW_W/2 - textWidth("TIME LEFT 00S", 1)/2, 100, "#ffffff", 1);
+    drawText(g, "COINS " + lv.coinsCollected, VIEW_W/2 - textWidth("COINS 00", 1)/2, 112, "#ffcc00", 1);
+    drawText(g, "STOMPS " + lv.stomps, VIEW_W/2 - textWidth("STOMPS 00", 1)/2, 124, "#ffffff", 1);
+    let stars = 1;
+    if (secsLeft > this.timeLimit / 60 / 3) stars++;
+    if (lv.player.coins > 5) stars++;
+    const starStr = "*".repeat(stars) + "-".repeat(3 - stars);
+    drawText(g, starStr, VIEW_W/2 - textWidth(starStr, 3)/2, 145, "#ffcc00", 3);
+    if (Math.floor(this.frame / 30) % 2 === 0) {
+      const msg = (this.missionIndex + 1 < MISSIONS.length && this.missionIndex + 1 < this.unlocked) ?
+        "PRESS Z FOR NEXT" : "PRESS Z FOR MENU";
+      drawText(g, msg, VIEW_W/2 - textWidth(msg, 1)/2, 200, "#ffffff", 1);
+    }
+  },
+
+  drawGameOver() {
+    g.fillStyle = "#101018";
+    g.fillRect(0, 0, VIEW_W, VIEW_H);
+    drawText(g, "GAME OVER", VIEW_W/2 - textWidth("GAME OVER", 3)/2, 90, "#e52521", 3);
+    drawText(g, "PRESS Z FOR MENU", VIEW_W/2 - textWidth("PRESS Z FOR MENU", 1)/2, 140, "#ffffff", 1);
+  }
+};
+
+/* ---------- LOOP ---------- */
+Game.init();
+let last = performance.now(), acc = 0;
+const STEP = 1000 / 60;
+
+function loop(now) {
+  acc += now - last;
+  last = now;
+  if (acc > 200) acc = 200;
+  while (acc >= STEP) {
+    Game.update();
+    Input.clear();
+    acc -= STEP;
+  }
+  Game.draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
